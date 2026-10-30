@@ -1,9 +1,9 @@
 """Fused cross-entropy in Triton.
 
-Patches Qwen2ForCausalLM.forward at the class level to replace
-self.loss_function before each call. This is the only reliable intercept
-point because transformers 5.x binds loss_function as an instance attribute
-in __init__ and TRL passes labels= directly to model.forward().
+Strategy: patch Qwen2ForCausalLM.forward to strip `labels` from the call,
+get logits from the original forward, then compute CE ourselves with Triton
+kernels. This bypasses all loss_function / CrossEntropyLoss binding issues
+since we never touch the model's internal loss path.
 """
 
 import torch
@@ -22,6 +22,7 @@ def fused_ce_fwd_kernel(
     row = tl.program_id(0)
     label = tl.load(labels_ptr + row)
 
+    # Pass 1: row max for numerical stability
     m = -1e9
     for v in range(0, V, BLOCK_V):
         cols = v + tl.arange(0, BLOCK_V)
@@ -29,6 +30,7 @@ def fused_ce_fwd_kernel(
         x = tl.load(logits_ptr + row * V + cols, mask=mask, other=-1e9).to(tl.float32)
         m = tl.maximum(m, tl.max(x, axis=0))
 
+    # Pass 2: log-sum-exp
     s = 0.0
     for v in range(0, V, BLOCK_V):
         cols = v + tl.arange(0, BLOCK_V)
@@ -105,27 +107,47 @@ def fused_cross_entropy(logits, labels, ignore_index=-100):
     return _FusedCE.apply(logits, labels, ignore_index)
 
 
-def _fused_loss_fn(logits, labels, vocab_size=None, num_items_in_batch=None, **kwargs):
-    """Drop-in for transformers ForCausalLMLoss — handles the shift internally."""
-    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-    shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
-    return fused_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-
-
 def patch_cross_entropy():
-    """Patch Qwen2ForCausalLM.forward to inject our loss_function before each call."""
+    """Patch Qwen2ForCausalLM.forward: strip labels, get logits, compute CE in Triton.
+
+    Works regardless of how the model internally binds CrossEntropyLoss or
+    loss_function — we bypass the model's loss path entirely.
+    """
     from transformers.models.qwen2 import modeling_qwen2
 
-    _orig_forward = modeling_qwen2.Qwen2ForCausalLM.forward
+    _orig = modeling_qwen2.Qwen2ForCausalLM.forward
 
-    def _patched_forward(self, *args, **kwargs):
-        # Replace loss_function on the instance for this call
-        _saved = getattr(self, "loss_function", None)
-        if _saved is not None:
-            self.loss_function = _fused_loss_fn
-        result = _orig_forward(self, *args, **kwargs)
-        if _saved is not None:
-            self.loss_function = _saved
-        return result
+    def _patched(self, *args, **kwargs):
+        labels = kwargs.pop("labels", None)
 
-    modeling_qwen2.Qwen2ForCausalLM.forward = _patched_forward
+        # labels may also come positionally (index 5 in Qwen2ForCausalLM.forward)
+        # signature: input_ids, attention_mask, position_ids, past_key_values,
+        #            inputs_embeds, labels, ...
+        pos_labels = None
+        if labels is None and len(args) > 5:
+            lst = list(args)
+            pos_labels = lst[5]
+            lst[5] = None
+            args = tuple(lst)
+
+        effective_labels = labels if labels is not None else pos_labels
+
+        # Call original forward without labels so it returns logits only
+        out = _orig(self, *args, **kwargs)
+
+        if effective_labels is None:
+            return out
+
+        logits = out.logits  # (B, T, V)
+        if logits is None:
+            return out
+
+        # Standard causal-LM shift: predict token t+1 from position t
+        shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+        shift_labels = effective_labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
+
+        loss = fused_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+        out.loss = loss
+        return out
+
+    modeling_qwen2.Qwen2ForCausalLM.forward = _patched
