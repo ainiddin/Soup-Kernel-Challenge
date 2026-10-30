@@ -8,10 +8,10 @@
 - Demo video (up to 3 minutes): <link>
 - Presentation: <link>
 
-## Team (up to 4 people)
+## Team (1 person)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
-| | | ainiddin | | |
+| Ainiddin | Developer (captain) | ainiddin | ainiddin | esirkepainiddin200631@gmail.com |
 
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
