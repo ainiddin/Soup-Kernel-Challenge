@@ -13,12 +13,12 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
-from .swiglu import patch_qwen2_mlp
+from .swiglu_fused import patch_qwen2_mlp_own
 from .rms_norm import patch_qwen2_rms_norm
 from .cross_entropy import patch_cross_entropy
 
 
 def apply():
-    patch_qwen2_mlp()          # example: fused SwiGLU (does not count as own kernel)
+    patch_qwen2_mlp_own()      # own kernel: fused SwiGLU forward + backward
     patch_qwen2_rms_norm()     # own kernel: fused RMSNorm forward + backward
     patch_cross_entropy()      # own kernel: chunked fused cross-entropy
