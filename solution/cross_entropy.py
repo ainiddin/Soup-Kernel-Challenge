@@ -58,7 +58,9 @@ def fused_ce_bwd_kernel(
     label = tl.load(labels_ptr + row)
     lse = tl.load(lse_ptr + row).to(tl.float32)
     upstream = tl.load(upstream_ptr).to(tl.float32)
-    scale = upstream / valid_count
+    # Ignored rows (label == ignore_index) do not contribute to the loss, so
+    # their gradient must be exactly zero. Zero the scale for those rows.
+    scale = tl.where(label == ignore_index, 0.0, upstream / valid_count)
 
     for v in range(0, V, BLOCK_V):
         cols = v + tl.arange(0, BLOCK_V)
