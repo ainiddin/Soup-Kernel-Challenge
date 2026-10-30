@@ -6,7 +6,7 @@
 - Public Kaggle notebook (saved version pinned to `COMMIT = 30ae7aa...`; same link is in README):
   https://www.kaggle.com/code/ainiddin/notebook2697177e12
 - Demo video (up to 3 minutes): <link>
-- Presentation: <link>
+- Presentation: `Soup-Kernel-Challenge-Decentrathon-6.pptx` (in the repository root)
 
 ## Team (1 person)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
