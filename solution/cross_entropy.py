@@ -1,9 +1,9 @@
-"""Fused cross-entropy forward and backward in Triton.
+"""Fused cross-entropy in Triton.
 
-Patches nn.CrossEntropyLoss.forward — the path Qwen2ForCausalLM uses
-internally via `loss_fct = CrossEntropyLoss(); loss = loss_fct(logits, labels)`.
-Each CTA handles one row and loops over the vocab internally, so no Python-level
-chunking loop and no materialised (N, V) softmax matrix during the forward pass.
+Qwen2ForCausalLM does `from torch.nn import CrossEntropyLoss` at module level,
+so patching nn.CrossEntropyLoss.forward is too late — the local name is already
+bound. We replace modeling_qwen2.CrossEntropyLoss with a subclass whose forward
+calls our Triton kernels for the LM-head shape (N, 151936).
 """
 
 import torch
@@ -22,7 +22,7 @@ def fused_ce_fwd_kernel(
     row = tl.program_id(0)
     label = tl.load(labels_ptr + row)
 
-    # Pass 1: row maximum
+    # Pass 1: row maximum for numerical stability
     m = -1e9
     for v in range(0, V, BLOCK_V):
         cols = v + tl.arange(0, BLOCK_V)
@@ -107,23 +107,40 @@ def fused_cross_entropy(logits, labels, ignore_index=-100):
     return _FusedCE.apply(logits, labels, ignore_index)
 
 
-_original_ce_forward = None
-
-
 def patch_cross_entropy():
-    """Patch nn.CrossEntropyLoss.forward — the path Qwen2ForCausalLM uses."""
-    import torch.nn as nn
-    global _original_ce_forward
-    _original_ce_forward = nn.CrossEntropyLoss.forward
+    """Replace modeling_qwen2.CrossEntropyLoss with a fused subclass.
 
-    def _patched_forward(self, input, target):
+    Qwen2ForCausalLM imports CrossEntropyLoss by name at module load time:
+        from torch.nn import CrossEntropyLoss
+    Patching nn.CrossEntropyLoss after that has no effect on that local name.
+    We must replace the name in the module's namespace directly.
+    """
+    from transformers.models.qwen2 import modeling_qwen2
+    import torch.nn as nn
+
+    _orig = getattr(modeling_qwen2, "CrossEntropyLoss", nn.CrossEntropyLoss)
+
+    class _FusedCELoss(_orig):
+        def forward(self, input, target):
+            if (input.dim() == 2
+                    and input.is_cuda
+                    and input.shape[-1] > 32000):
+                return fused_cross_entropy(input, target,
+                                           ignore_index=self.ignore_index)
+            return super().forward(input, target)
+
+    modeling_qwen2.CrossEntropyLoss = _FusedCELoss
+
+    # Also patch nn.CrossEntropyLoss.forward as a belt-and-suspenders fallback
+    # (covers any Soup/TRL code that instantiates CrossEntropyLoss after apply())
+    _orig_nn_fwd = nn.CrossEntropyLoss.forward
+
+    def _nn_fwd(self, input, target):
         if (input.dim() == 2
                 and input.is_cuda
-                and self.label_smoothing == 0.0
-                and self.reduction == 'mean'
-                and self.weight is None
                 and input.shape[-1] > 32000):
-            return fused_cross_entropy(input, target, ignore_index=self.ignore_index)
-        return _original_ce_forward(self, input, target)
+            return fused_cross_entropy(input, target,
+                                       ignore_index=self.ignore_index)
+        return _orig_nn_fwd(self, input, target)
 
-    nn.CrossEntropyLoss.forward = _patched_forward
+    nn.CrossEntropyLoss.forward = _nn_fwd
