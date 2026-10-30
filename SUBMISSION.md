@@ -1,10 +1,10 @@
 # Submission: <team name>
 
 ## Links
-- Repository, final commit: https://github.com/ainiddin/Soup-Kernel-Challenge/commit/<FINAL_SHA>
-- Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link must
-  be in your README):
-  https://www.kaggle.com/code/<you>/<notebook>?scriptVersionId=<version>
+- Repository, final commit: https://github.com/ainiddin/Soup-Kernel-Challenge/commit/30ae7aaec65cc2b04c2acd0761b21bb166cfae17
+  (also in the team repo: https://github.com/BAITC-Hacks/hack-0f0c42c6-world)
+- Public Kaggle notebook (saved version pinned to `COMMIT = 30ae7aa...`; same link is in README):
+  https://www.kaggle.com/code/ainiddin/notebook2697177e12
 - Demo video (up to 3 minutes): <link>
 - Presentation: <link>
 

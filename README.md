@@ -17,7 +17,7 @@ All 10 checks of `harness/check_rules.py` pass.
 - Loss curve follows the base: first step within 0.02%, mean of all steps within 0.26%.
 - Soup's outputs (steps, adapter, trainer settings, tokens, metrics, rewind) identical within
   tolerance.
-- Public Kaggle notebook: **<paste your public notebook link here>**
+- Public Kaggle notebook: **https://www.kaggle.com/code/ainiddin/notebook2697177e12**
 
 ## What we did
 
