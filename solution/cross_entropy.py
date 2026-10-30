@@ -1,169 +1,129 @@
-"""Fused cross-entropy that avoids materialising the full (N, vocab) gradient tensor.
+"""Fused cross-entropy forward and backward in Triton.
 
-Instead of storing softmax(logits) as a (N, 151936) fp32 matrix and then
-computing CE, we process logits in vocabulary chunks:
-  forward  – two-pass (max then sum-exp) over chunks → only log_sum_exp per row stored
-  backward – recompute each chunk on the fly → d_hidden accumulated directly
-
-Memory saved: ~1.2 GB (forward logits grad + no full softmax matrix).
-Time saved: ~7 % of training time (cross-entropy was that fraction of the base).
+Patches nn.CrossEntropyLoss.forward — the path Qwen2ForCausalLM uses
+internally via `loss_fct = CrossEntropyLoss(); loss = loss_fct(logits, labels)`.
+Each CTA handles one row and loops over the vocab internally, so no Python-level
+chunking loop and no materialised (N, V) softmax matrix during the forward pass.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# Vocabulary chunk size: large enough for efficiency, small enough to fit L2.
-CHUNK = 4096
+BLOCK_V = 1024
 
 
 @triton.jit
-def lse_forward_kernel(
-    logits_ptr,   # (N, C) – one vocabulary chunk, float32
-    lse_ptr,      # (N,)   – running log-sum-exp accumulator, float32
-    N, C,
-    BLOCK_C: tl.constexpr,
+def fused_ce_fwd_kernel(
+    logits_ptr, labels_ptr, loss_ptr, lse_ptr,
+    N, V, ignore_index,
+    BLOCK_V: tl.constexpr,
 ):
-    """Merge a logit chunk into the running log-sum-exp (log-add-exp style)."""
     row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_C)
-    mask = cols < C
-    x = tl.load(logits_ptr + row * C + cols, mask=mask, other=-1e9).to(tl.float32)
-    chunk_max = tl.max(x, axis=0)
+    label = tl.load(labels_ptr + row)
 
-    cur = tl.load(lse_ptr + row).to(tl.float32)
-    new_max = tl.maximum(cur, chunk_max)
-    # log(exp(cur) + sum_exp(x - chunk_max) * exp(chunk_max))
-    # = new_max + log(exp(cur - new_max) + sum(exp(x - new_max)))
-    old_exp = tl.exp(cur - new_max)
-    chunk_sum = tl.sum(tl.where(mask, tl.exp(x - new_max), 0.0), axis=0)
-    tl.store(lse_ptr + row, new_max + tl.log(old_exp + chunk_sum))
+    # Pass 1: row maximum
+    m = -1e9
+    for v in range(0, V, BLOCK_V):
+        cols = v + tl.arange(0, BLOCK_V)
+        mask = cols < V
+        x = tl.load(logits_ptr + row * V + cols, mask=mask, other=-1e9).to(tl.float32)
+        m = tl.maximum(m, tl.max(x, axis=0))
+
+    # Pass 2: log-sum-exp
+    s = 0.0
+    for v in range(0, V, BLOCK_V):
+        cols = v + tl.arange(0, BLOCK_V)
+        mask = cols < V
+        x = tl.load(logits_ptr + row * V + cols, mask=mask, other=-1e9).to(tl.float32)
+        s += tl.sum(tl.where(mask, tl.exp(x - m), 0.0), axis=0)
+
+    lse = m + tl.log(s)
+    tl.store(lse_ptr + row, lse)
+
+    if label != ignore_index:
+        tgt = tl.load(logits_ptr + row * V + label).to(tl.float32)
+        tl.store(loss_ptr + row, lse - tgt)
+    else:
+        tl.store(loss_ptr + row, 0.0)
 
 
 @triton.jit
-def ce_loss_and_grad_kernel(
-    logits_ptr,   # (N, C) float32 – logit chunk
-    lse_ptr,      # (N,)   float32 – final log-sum-exp
-    target_ptr,   # (N,)   int64
-    dloss_ptr,    # scalar – upstream gradient (1/valid_count * global_scale)
-    dlogits_ptr,  # (N, C) float32 – gradient output
-    loss_ptr,     # (N,)   float32 – per-row loss contribution (for target in chunk)
-    N, C, V_offset,
-    IGNORE_IDX: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+def fused_ce_bwd_kernel(
+    logits_ptr, labels_ptr, dlogits_ptr, upstream_ptr, lse_ptr,
+    N, V, valid_count, ignore_index,
+    BLOCK_V: tl.constexpr,
 ):
-    """Compute per-chunk CE gradient; add target logit to loss where applicable."""
     row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_C)
-    mask = cols < C
-    abs_cols = V_offset + cols
-
-    x = tl.load(logits_ptr + row * C + cols, mask=mask, other=-1e9).to(tl.float32)
+    label = tl.load(labels_ptr + row)
     lse = tl.load(lse_ptr + row).to(tl.float32)
-    target = tl.load(target_ptr + row)
-    dloss = tl.load(dloss_ptr).to(tl.float32)
+    upstream = tl.load(upstream_ptr).to(tl.float32)
+    scale = upstream / valid_count
 
-    # Softmax value for this chunk
-    softmax = tl.where(mask, tl.exp(x - lse), 0.0)
-
-    # Gradient: softmax - one_hot(target)
-    is_target = (abs_cols == target) & mask
-    dlogit = softmax - tl.where(is_target, 1.0, 0.0)
-
-    if target == IGNORE_IDX:
-        dlogit = tl.zeros_like(dlogit)
-
-    tl.store(dlogits_ptr + row * C + cols, dlogit * dloss, mask=mask)
-
-    # Accumulate loss: -x[target] if target in this chunk
-    tgt_logit = tl.sum(tl.where(is_target, x, 0.0), axis=0)
-    if target != IGNORE_IDX:
-        tl.atomic_add(loss_ptr + row, tgt_logit)
+    for v in range(0, V, BLOCK_V):
+        cols = v + tl.arange(0, BLOCK_V)
+        mask = cols < V
+        x = tl.load(logits_ptr + row * V + cols, mask=mask, other=-1e9).to(tl.float32)
+        softmax = tl.where(mask, tl.exp(x - lse), 0.0)
+        is_target = mask & (cols == label) & (label != ignore_index)
+        dlogit = (softmax - tl.where(is_target, 1.0, 0.0)) * scale
+        tl.store(dlogits_ptr + row * V + cols, dlogit, mask=mask)
 
 
-class _FusedCrossEntropy(torch.autograd.Function):
+class _FusedCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, ignore_index=-100):
-        # logits: (N, V), targets: (N,)
+    def forward(ctx, logits, labels, ignore_index):
         N, V = logits.shape
         logits_f = logits.float().contiguous()
-
-        # --- Pass 1: compute log-sum-exp across all vocab chunks ---
-        lse = torch.full((N,), -1e9, device=logits.device, dtype=torch.float32)
-        BLOCK_C = min(CHUNK, triton.next_power_of_2(V))
-        for v in range(0, V, BLOCK_C):
-            c = min(BLOCK_C, V - v)
-            chunk = logits_f[:, v:v + c].contiguous()
-            lse_forward_kernel[(N,)](chunk, lse, N, c, BLOCK_C=BLOCK_C)
-
-        # --- Compute per-row loss = lse - logit[target] ---
-        # We do this in PyTorch (cheap scalar gather)
-        valid = targets != ignore_index
-        target_safe = targets.clone()
-        target_safe[~valid] = 0
-        target_logit = logits_f[torch.arange(N, device=logits.device), target_safe]
-        per_row_loss = torch.where(valid, lse - target_logit, torch.zeros_like(lse))
-        loss = per_row_loss.sum() / valid.sum().clamp(min=1)
-
-        ctx.save_for_backward(logits_f, targets, lse)
+        labels_c = labels.contiguous()
+        loss_per_row = torch.empty(N, device=logits.device, dtype=torch.float32)
+        lse = torch.empty(N, device=logits.device, dtype=torch.float32)
+        fused_ce_fwd_kernel[(N,)](
+            logits_f, labels_c, loss_per_row, lse,
+            N, V, ignore_index, BLOCK_V=BLOCK_V,
+        )
+        valid = (labels_c != ignore_index).sum().clamp(min=1)
+        loss = loss_per_row.sum() / valid
+        ctx.save_for_backward(logits_f, labels_c, lse)
         ctx.ignore_index = ignore_index
-        ctx.N = N
-        ctx.V = V
-        ctx.BLOCK_C = BLOCK_C
-        ctx.valid_count = int(valid.sum().item())
-        return loss
+        ctx.valid_count = int(valid.item())
+        return loss.to(logits.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits_f, targets, lse = ctx.saved_tensors
-        N, V = ctx.N, ctx.V
-        BLOCK_C = ctx.BLOCK_C
-        valid_count = max(ctx.valid_count, 1)
-        ignore_index = ctx.ignore_index
-
-        # upstream: grad_output / valid_count (scalar)
-        dloss = (grad_output / valid_count).to(torch.float32).contiguous()
-        dlogits = torch.empty(N, V, device=logits_f.device, dtype=torch.float32)
-        # dummy per-row loss accumulator (not used in bwd, kernel needs it)
-        dummy_loss = torch.zeros(N, device=logits_f.device, dtype=torch.float32)
-
-        for v in range(0, V, BLOCK_C):
-            c = min(BLOCK_C, V - v)
-            chunk = logits_f[:, v:v + c].contiguous()
-            dchunk = dlogits[:, v:v + c].contiguous()
-            ce_loss_and_grad_kernel[(N,)](
-                chunk, lse, targets, dloss, dchunk, dummy_loss,
-                N, c, v,
-                IGNORE_IDX=ignore_index,
-                BLOCK_C=BLOCK_C,
-            )
-            dlogits[:, v:v + c] = dchunk
-
-        return dlogits.to(logits_f.dtype), None, None
+        logits_f, labels_c, lse = ctx.saved_tensors
+        N, V = logits_f.shape
+        dlogits = torch.empty_like(logits_f)
+        upstream = grad_output.float().contiguous()
+        fused_ce_bwd_kernel[(N,)](
+            logits_f, labels_c, dlogits, upstream, lse,
+            N, V, ctx.valid_count, ctx.ignore_index,
+            BLOCK_V=BLOCK_V,
+        )
+        return dlogits.to(grad_output.dtype), None, None
 
 
-def fused_cross_entropy(logits, targets, ignore_index=-100):
-    return _FusedCrossEntropy.apply(logits, targets, ignore_index)
+def fused_cross_entropy(logits, labels, ignore_index=-100):
+    return _FusedCE.apply(logits, labels, ignore_index)
 
 
-_original_ce = None
+_original_ce_forward = None
 
 
 def patch_cross_entropy():
-    """Patch torch.nn.functional.cross_entropy used by TRL's SFTTrainer."""
-    import torch.nn.functional as F
-    global _original_ce
-    _original_ce = F.cross_entropy
+    """Patch nn.CrossEntropyLoss.forward — the path Qwen2ForCausalLM uses."""
+    import torch.nn as nn
+    global _original_ce_forward
+    _original_ce_forward = nn.CrossEntropyLoss.forward
 
-    def _patched_ce(input, target, weight=None, size_average=None, ignore_index=-100,
-                    reduce=None, reduction='mean', label_smoothing=0.0):
-        # Only intercept the LM-head case: large vocab, no label smoothing, mean reduction
-        if (input.dim() == 2 and input.is_cuda and label_smoothing == 0.0
-                and reduction == 'mean' and weight is None
+    def _patched_forward(self, input, target):
+        if (input.dim() == 2
+                and input.is_cuda
+                and self.label_smoothing == 0.0
+                and self.reduction == 'mean'
+                and self.weight is None
                 and input.shape[-1] > 32000):
-            return fused_cross_entropy(input, target, ignore_index=ignore_index)
-        return _original_ce(input, target, weight=weight, size_average=size_average,
-                            ignore_index=ignore_index, reduce=reduce, reduction=reduction,
-                            label_smoothing=label_smoothing)
+            return fused_cross_entropy(input, target, ignore_index=self.ignore_index)
+        return _original_ce_forward(self, input, target)
 
-    F.cross_entropy = _patched_ce
+    nn.CrossEntropyLoss.forward = _patched_forward
