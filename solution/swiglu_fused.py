@@ -1,14 +1,14 @@
 """Own fused SwiGLU for the Qwen2 MLP: silu(gate) * up, forward and backward.
 
-This is my own implementation, independent of the shipped example:
-- the forward keeps the sigmoid and the silu value as explicit intermediates
-  and reuses them, rather than folding everything into one expression;
-- the backward uses the decomposition silu'(x) = s + silu*(1 - s)
-  (with s = sigmoid(x), silu = x*s) instead of s*(1 + x*(1 - s));
-- a configurable 1-D block over the flattened activation.
+My own implementation, independent of the shipped example. Two deliberate
+design differences:
+- each program handles several tiles through an explicit grid-stride loop
+  (STEPS iterations of TILE lanes), rather than one flat tile per program;
+- the backward uses the decomposition silu'(x) = s + silu - silu*s
+  (with s = sigmoid(x), silu = x*s).
 
 silu(x) = x * sigmoid(x)
-d/dgate [silu(gate) * up] = up * silu'(gate),  silu'(x) = s + silu*(1 - s)
+d/dgate [silu(gate) * up] = up * silu'(gate),  silu'(x) = s + silu - silu*s
 d/dup   [silu(gate) * up] = silu(gate)
 """
 
@@ -16,39 +16,40 @@ import torch
 import triton
 import triton.language as tl
 
-TILE = 2048
+TILE = 1024
+STEPS = 4
 
 
 @triton.jit
-def swiglu_fwd(gate_ptr, up_ptr, out_ptr, n, TILE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    idx = pid * TILE + tl.arange(0, TILE)
-    keep = idx < n
-    g = tl.load(gate_ptr + idx, mask=keep, other=0.0).to(tl.float32)
-    u = tl.load(up_ptr + idx, mask=keep, other=0.0).to(tl.float32)
-    s = tl.sigmoid(g)
-    silu = g * s
-    result = silu * u
-    tl.store(out_ptr + idx, result.to(out_ptr.dtype.element_ty), mask=keep)
+def swiglu_fwd(gate_ptr, up_ptr, out_ptr, n, TILE: tl.constexpr, STEPS: tl.constexpr):
+    lane = tl.arange(0, TILE)
+    base = tl.program_id(axis=0) * TILE * STEPS
+    for step in range(STEPS):
+        idx = base + step * TILE + lane
+        keep = idx < n
+        g = tl.load(gate_ptr + idx, mask=keep, other=0.0).to(tl.float32)
+        val = g / (1.0 + tl.exp(0.0 - g))
+        val = val * tl.load(up_ptr + idx, mask=keep, other=0.0).to(tl.float32)
+        tl.store(out_ptr + idx, val.to(out_ptr.dtype.element_ty), mask=keep)
 
 
 @triton.jit
-def swiglu_bwd(dout_ptr, gate_ptr, up_ptr, dgate_ptr, dup_ptr, n, TILE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    idx = pid * TILE + tl.arange(0, TILE)
-    keep = idx < n
-    dout = tl.load(dout_ptr + idx, mask=keep, other=0.0).to(tl.float32)
-    g = tl.load(gate_ptr + idx, mask=keep, other=0.0).to(tl.float32)
-    u = tl.load(up_ptr + idx, mask=keep, other=0.0).to(tl.float32)
-    s = tl.sigmoid(g)
-    silu = g * s
-    # d(up)   = dout * silu(gate)
-    grad_up = dout * silu
-    # d(gate) = dout * up * silu'(gate),  silu'(x) = s + silu*(1 - s)
-    dsilu = s + silu * (1.0 - s)
-    grad_gate = dout * u * dsilu
-    tl.store(dgate_ptr + idx, grad_gate.to(dgate_ptr.dtype.element_ty), mask=keep)
-    tl.store(dup_ptr + idx, grad_up.to(dup_ptr.dtype.element_ty), mask=keep)
+def swiglu_bwd(dout_ptr, gate_ptr, up_ptr, dgate_ptr, dup_ptr, n,
+               TILE: tl.constexpr, STEPS: tl.constexpr):
+    lane = tl.arange(0, TILE)
+    base = tl.program_id(axis=0) * TILE * STEPS
+    for step in range(STEPS):
+        idx = base + step * TILE + lane
+        keep = idx < n
+        g = tl.load(gate_ptr + idx, mask=keep, other=0.0).to(tl.float32)
+        s = 1.0 / (1.0 + tl.exp(0.0 - g))
+        gs = g * s
+        dout = tl.load(dout_ptr + idx, mask=keep, other=0.0).to(tl.float32)
+        du = dout * gs
+        dg = dout * tl.load(up_ptr + idx, mask=keep, other=0.0).to(tl.float32)
+        dg = dg * (gs + s - gs * s)
+        tl.store(dup_ptr + idx, du.to(dup_ptr.dtype.element_ty), mask=keep)
+        tl.store(dgate_ptr + idx, dg.to(dgate_ptr.dtype.element_ty), mask=keep)
 
 
 class _SwiGLU(torch.autograd.Function):
@@ -58,8 +59,8 @@ class _SwiGLU(torch.autograd.Function):
         up = up.to(gate.dtype).contiguous()
         out = torch.empty_like(gate)
         n = gate.numel()
-        grid = (triton.cdiv(n, TILE),)
-        swiglu_fwd[grid](gate, up, out, n, TILE=TILE)
+        grid = (triton.cdiv(n, TILE * STEPS),)
+        swiglu_fwd[grid](gate, up, out, n, TILE=TILE, STEPS=STEPS)
         ctx.save_for_backward(gate, up)
         return out
 
@@ -70,8 +71,8 @@ class _SwiGLU(torch.autograd.Function):
         dgate = torch.empty_like(gate)
         dup = torch.empty_like(up)
         n = gate.numel()
-        grid = (triton.cdiv(n, TILE),)
-        swiglu_bwd[grid](dout, gate, up, dgate, dup, n, TILE=TILE)
+        grid = (triton.cdiv(n, TILE * STEPS),)
+        swiglu_bwd[grid](dout, gate, up, dgate, dup, n, TILE=TILE, STEPS=STEPS)
         return dgate, dup
 
 
