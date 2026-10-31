@@ -5,7 +5,7 @@
   (also in the team repo: https://github.com/BAITC-Hacks/hack-0f0c42c6-world)
 - Public Kaggle notebook (saved version pinned to `COMMIT = 30ae7aa...`; same link is in README):
   https://www.kaggle.com/code/ainiddin/notebook2697177e12
-- Demo video (up to 3 minutes): <link>
+- Demo video (up to 3 minutes): https://youtu.be/uWTXmv2_lsI
 - Presentation: `Soup-Kernel-Challenge-Decentrathon-6.pptx` (in the repository root)
 
 ## Team (1 person)
